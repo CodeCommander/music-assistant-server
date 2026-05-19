@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import MediaType
 from music_assistant_models.errors import MediaNotFoundError
@@ -164,6 +164,7 @@ class AppleMusicRecommendationManager:
 
     async def browse_stations(self) -> list[ItemMapping | Playlist]:
         """Return recommended radio stations from personal recommendations."""
-        return [
-            item for folder in await self.get_personal_recommendations() for item in folder.items
-        ]
+        return cast(
+            "list[ItemMapping | Playlist]",
+            [item for folder in await self.get_personal_recommendations() for item in folder.items],
+        )

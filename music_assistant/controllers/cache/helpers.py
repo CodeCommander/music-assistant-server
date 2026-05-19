@@ -4,17 +4,35 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, cast, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Concatenate,
+    ParamSpec,
+    Protocol,
+    TypeVar,
+    cast,
+    get_type_hints,
+)
 
 from music_assistant.controllers.cache.constants import DEFAULT_CACHE_EXPIRATION, SerializableType
 from music_assistant.helpers.api import parse_value
 
 if TYPE_CHECKING:
-    from music_assistant.models.core_controller import CoreController
-    from music_assistant.models.provider import Provider
+    from music_assistant.mass import MusicAssistant
 
 
-ProviderT = TypeVar("ProviderT", bound="Provider | CoreController")
+class _CacheableSelf(Protocol):
+    """Structural type for the `self` argument of @use_cache-decorated methods."""
+
+    @property
+    def mass(self) -> MusicAssistant: ...
+
+    @property
+    def domain(self) -> str: ...
+
+
+ProviderT = TypeVar("ProviderT", bound=_CacheableSelf)
 P = ParamSpec("P")
 R = TypeVar("R")
 
