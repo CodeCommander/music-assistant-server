@@ -1,0 +1,15 @@
+{
+  "type": "plugin",
+  "stage": "alpha",
+  "domain": "ytmusic_cast",
+  "name": "YouTube Music Cast Receiver",
+  "description": "Makes a Music Assistant player appear as a cast target in the YouTube Music app, so you can hand off the playback queue from your phone to Music Assistant.",
+  "codeowners": ["@CodeCommander"],
+  "credits": [
+    "[yt-cast-receiver by patrickkfkan](https://github.com/patrickkfkan/yt-cast-receiver) (protocol reference)"
+  ],
+  "documentation": "https://music-assistant.io/plugins/ytmusic-cast/",
+  "depends_on": "ytmusic",
+  "multi_instance": true,
+  "requirements": []
+}

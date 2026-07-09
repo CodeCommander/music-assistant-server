@@ -1,0 +1,23 @@
+{
+  "config_entries": {
+    "mass_player_id": {
+      "label": "[%key:common::config_entries::mass_player_id::label%]",
+      "description": "The Music Assistant player this cast target controls. When you cast from the YouTube Music app to this device, the queue plays on the selected player."
+    },
+    "cast_name": {
+      "label": "Cast Device Name",
+      "description": "How this receiver appears in the YouTube Music app's cast device list."
+    },
+    "keep_playing_on_disconnect": {
+      "label": "Keep playing when the phone disconnects",
+      "description": "Continue playback on the player when the casting phone disconnects or leaves the network. Disable to stop playback on disconnect."
+    },
+    "port": {
+      "label": "DIAL port",
+      "description": "TCP port for this instance's DIAL endpoint (allocated automatically)."
+    }
+  },
+  "manifest": {
+    "description": "Makes a Music Assistant player appear as a cast target in the YouTube Music app, so you can hand off the playback queue from your phone to Music Assistant."
+  }
+}
