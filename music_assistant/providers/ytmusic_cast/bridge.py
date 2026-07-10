@@ -68,6 +68,7 @@ class CastQueueBridge:
         self._last_volume_sent: int | None = None
         self._phone_volume: tuple[int, float] | None = None  # (level, monotonic ts)
         self._cpn: str = _new_cpn()
+        self._seek_handle: asyncio.TimerHandle | None = None
 
     @property
     def queue_id(self) -> str:
@@ -124,7 +125,7 @@ class CastQueueBridge:
                 await self.mass.player_queues.previous(self.queue_id)
             case "seekTo":
                 position = int(float(payload.get("newTime") or 0))
-                await self.mass.player_queues.seek(self.queue_id, position)
+                self._schedule_seek(position)
             case "setVolume":
                 volume = int(float(payload.get("volume") or 0))
                 self._phone_volume = (volume, time.monotonic())
@@ -249,6 +250,29 @@ class CastQueueBridge:
             if ma_index == queue.current_index:
                 return lounge_index
         return None
+
+    def _schedule_seek(self, position: int) -> None:
+        """
+        Debounce seek requests (last one wins).
+
+        A scrub gesture on the phone emits a burst of seekTo messages; each MA
+        seek restarts the stream, and racing restarts can reset playback to the
+        start of the track. Waiting for the burst to settle avoids that.
+        """
+        if self._seek_handle:
+            self._seek_handle.cancel()
+
+        def _fire() -> None:
+            self._seek_handle = None
+            self.mass.create_task(self._do_seek(position))
+
+        self._seek_handle = asyncio.get_running_loop().call_later(0.4, _fire)
+
+    async def _do_seek(self, position: int) -> None:
+        try:
+            await self.mass.player_queues.seek(self.queue_id, position)
+        except Exception as err:
+            self.logger.warning("Seek to %ss failed: %s", position, err)
 
     async def _on_ma_event(self, event: MassEvent) -> None:
         """Mirror MA player/queue state changes back to connected senders."""
