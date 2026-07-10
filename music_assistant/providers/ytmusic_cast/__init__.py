@@ -15,6 +15,7 @@ ssdp.py) plus a small per-instance HTTP endpoint (dial.py).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import socket
 from typing import TYPE_CHECKING, cast
@@ -26,6 +27,12 @@ from music_assistant.constants import CONF_ENTRY_WARN_PREVIEW
 from music_assistant.helpers.util import select_free_port
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.ytmusic_cast.dial import DialServer
+from music_assistant.providers.ytmusic_cast.lounge.messages import (
+    LoungeMessage,
+    now_playing,
+    on_volume_changed,
+)
+from music_assistant.providers.ytmusic_cast.lounge.session import LoungeSession, ScreenInfo
 from music_assistant.providers.ytmusic_cast.ssdp import DialAdvertisement, SharedSsdpResponder
 
 if TYPE_CHECKING:
@@ -38,6 +45,7 @@ if TYPE_CHECKING:
 CONF_MASS_PLAYER_ID = "mass_player_id"
 CONF_CAST_NAME = "cast_name"
 CONF_PORT = "port"
+CONF_SCREEN_ID = "screen_id"
 CONF_KEEP_PLAYING_ON_DISCONNECT = "keep_playing_on_disconnect"
 
 DEFAULT_CAST_NAME = "Music Assistant"
@@ -105,6 +113,13 @@ async def get_config_entries(
             required=False,
             hidden=True,
         ),
+        ConfigEntry(
+            key=CONF_SCREEN_ID,
+            type=ConfigEntryType.STRING,
+            default_value=None,
+            required=False,
+            hidden=True,
+        ),
     )
 
 
@@ -112,6 +127,7 @@ class YTMusicCastProvider(PluginProvider):
     """Exposes a Music Assistant player as a YouTube Music cast target."""
 
     _dial_server: DialServer | None = None
+    _lounge_session: LoungeSession | None = None
 
     async def handle_async_init(self) -> None:
         """Start the DIAL endpoint and register the SSDP advertisement."""
@@ -143,6 +159,16 @@ class YTMusicCastProvider(PluginProvider):
             ),
             self.logger,
         )
+        self._lounge_session = LoungeSession(
+            http_session=self.mass.http_session,
+            screen=ScreenInfo(name=self.cast_name, device_id=self.device_uuid),
+            get_screen_id=lambda: cast("str | None", self.config.get_value(CONF_SCREEN_ID)),
+            set_screen_id=self._persist_screen_id,
+            on_messages=self._handle_lounge_messages,
+            on_terminate=self._handle_lounge_terminate,
+            logger=self.logger,
+        )
+        self.mass.create_task(self._start_lounge_session())
         self.logger.info(
             "Cast target '%s' advertising for player %s (DIAL port %s)",
             self.cast_name,
@@ -151,24 +177,78 @@ class YTMusicCastProvider(PluginProvider):
         )
 
     async def unload(self, is_removed: bool = False) -> None:
-        """Tear down SSDP advertisement and DIAL endpoint."""
+        """Tear down lounge session, SSDP advertisement and DIAL endpoint."""
+        if self._lounge_session:
+            await self._lounge_session.end()
+            self._lounge_session = None
         await SharedSsdpResponder.get().unregister(self.device_uuid)
         if self._dial_server:
             await self._dial_server.stop()
             self._dial_server = None
 
+    async def _start_lounge_session(self) -> None:
+        """Establish the lounge session, retrying a few times on startup failures."""
+        assert self._lounge_session is not None
+        for attempt in range(1, 4):
+            try:
+                await self._lounge_session.begin()
+            except Exception as err:
+                self.logger.warning(
+                    "Failed to establish lounge session (attempt %s/3): %s", attempt, err
+                )
+                await asyncio.sleep(10 * attempt)
+            else:
+                return
+        self.logger.error("Lounge session could not be established; casting will not work")
+
     async def _handle_dial_launch(self, params: dict[str, str]) -> None:
         """
         Handle a cast launch from a sender app.
 
-        Phase 1 skeleton: log the pairing code. The lounge session (next phase)
-        will register the pairing code so the sender connects to our screen.
+        Registers the pairing code with the lounge session so the sender's
+        connection completes through YouTube's cloud.
         """
-        self.logger.info(
-            "Cast launch received (pairingCode=%s theme=%s) - lounge session not yet implemented",
-            params.get("pairingCode"),
-            params.get("theme"),
-        )
+        pairing_code = params.get("pairingCode", "")
+        if not self._lounge_session or not self._lounge_session.running:
+            self.logger.warning("Cast launch received but lounge session is not running")
+            return
+        try:
+            await self._lounge_session.register_pairing_code(pairing_code)
+        except Exception as err:
+            self.logger.error("Failed to register pairing code: %s", err)
+
+    async def _handle_lounge_messages(self, messages: list[LoungeMessage]) -> None:
+        """
+        Handle inbound lounge messages.
+
+        Phase 2: log everything verbatim and answer the minimal probes senders
+        use to consider the screen alive (getNowPlaying / getVolume). The queue
+        bridge that acts on setPlaylist and transport commands comes next.
+        """
+        assert self._lounge_session is not None
+        for message in messages:
+            self.logger.info(
+                "LOUNGE message '%s' (AID=%s): %s", message.name, message.aid, message.payload
+            )
+            if message.name == "getNowPlaying":
+                await self._lounge_session.send(now_playing(message.aid))
+            elif message.name == "getVolume":
+                await self._lounge_session.send(
+                    on_volume_changed(message.aid, level=50, muted=False)
+                )
+
+    def _handle_lounge_terminate(self, error: Exception) -> None:
+        """Log irrecoverable lounge session death (a cast will restart it via retry)."""
+        self.logger.error("Lounge session terminated: %s", error)
+
+    def _persist_screen_id(self, screen_id: str) -> None:
+        """Persist the screen id so the phone can reconnect across MA restarts."""
+        try:
+            self.mass.config.set_raw_provider_config_value(
+                self.instance_id, CONF_SCREEN_ID, screen_id
+            )
+        except Exception as err:
+            self.logger.debug("Failed to persist screen id: %s", err)
 
     async def _resolve_port(self) -> int:
         """Return this instance's persistent DIAL port, allocating one if needed."""
