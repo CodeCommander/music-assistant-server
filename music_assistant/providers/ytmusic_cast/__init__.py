@@ -26,6 +26,7 @@ from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant.constants import CONF_ENTRY_WARN_PREVIEW
 from music_assistant.helpers.util import select_free_port
 from music_assistant.models.plugin import PluginProvider
+from music_assistant.providers.ytmusic_cast.bridge import CastQueueBridge
 from music_assistant.providers.ytmusic_cast.dial import DialServer
 from music_assistant.providers.ytmusic_cast.lounge.messages import (
     LoungeMessage,
@@ -128,6 +129,7 @@ class YTMusicCastProvider(PluginProvider):
 
     _dial_server: DialServer | None = None
     _lounge_session: LoungeSession | None = None
+    _bridge: CastQueueBridge | None = None
 
     async def handle_async_init(self) -> None:
         """Start the DIAL endpoint and register the SSDP advertisement."""
@@ -168,6 +170,7 @@ class YTMusicCastProvider(PluginProvider):
             on_terminate=self._handle_lounge_terminate,
             logger=self.logger,
         )
+        self._bridge = CastQueueBridge(self)
         self.mass.create_task(self._start_lounge_session())
         self.logger.info(
             "Cast target '%s' advertising for player %s (DIAL port %s)",
@@ -230,15 +233,21 @@ class YTMusicCastProvider(PluginProvider):
         """
         Handle inbound lounge messages.
 
-        Phase 2: log everything verbatim and answer the minimal probes senders
-        use to consider the screen alive (getNowPlaying / getVolume). The queue
-        bridge that acts on setPlaylist and transport commands comes next.
+        Queue and transport messages go to the bridge; liveness probes are
+        answered here. Everything else is logged for protocol visibility.
         """
         assert self._lounge_session is not None
+        assert self._bridge is not None
         for message in messages:
-            self.logger.info(
+            self.logger.debug(
                 "LOUNGE message '%s' (AID=%s): %s", message.name, message.aid, message.payload
             )
+            try:
+                if await self._bridge.handle_message(message):
+                    continue
+            except Exception as err:
+                self.logger.exception("Error handling '%s' message: %s", message.name, err)
+                continue
             if message.name == "getNowPlaying":
                 await self._lounge_session.send(now_playing(message.aid))
             elif message.name == "getVolume":
