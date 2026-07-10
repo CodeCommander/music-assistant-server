@@ -12,18 +12,36 @@ queue controller; volume maps to the player.
 from __future__ import annotations
 
 import asyncio
+import secrets
+import time
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import MediaType, QueueOption
+from music_assistant_models.enums import EventType, MediaType, PlaybackState, QueueOption
+
+from music_assistant.providers.ytmusic_cast.lounge.messages import (
+    PLAYER_STATUS_IDLE,
+    PLAYER_STATUS_PAUSED,
+    PLAYER_STATUS_PLAYING,
+    LoungeMessage,
+    now_playing,
+    on_has_previous_next_changed,
+    on_state_change,
+    on_volume_changed,
+)
 
 if TYPE_CHECKING:
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.media_items import Track
 
     from music_assistant.providers.ytmusic_cast import YTMusicCastProvider
-    from music_assistant.providers.ytmusic_cast.lounge.messages import LoungeMessage
 
 # concurrent ytmusic get_track lookups for a cold cast queue (uncached upstream)
 RESOLVE_CONCURRENCY = 8
+# debounce for outbound state pushes (matches the reference's volume debounce)
+STATE_PUSH_DEBOUNCE = 0.2
+# window in which a player volume change matching a phone-set value is treated
+# as the echo of that command rather than a change to report back
+VOLUME_ECHO_WINDOW = 3.0
 
 
 class CastQueueBridge:
@@ -39,13 +57,48 @@ class CastQueueBridge:
         # lounge queue index -> MA queue index (differs when tracks fail to resolve)
         self._index_map: dict[int, int] = {}
         self._list_id: str | None = None
+        self._ctt: str | None = None
         # guards concurrent setPlaylist handling (phone can resend on reconnect)
         self._load_lock = asyncio.Lock()
+        # outbound state tracking
+        self._unsubs: list[Any] = []
+        self._last_video_id: str | None = None
+        self._last_status: int | None = None
+        self._last_position: float = 0
+        self._last_volume_sent: int | None = None
+        self._phone_volume: tuple[int, float] | None = None  # (level, monotonic ts)
+        self._cpn: str = _new_cpn()
 
     @property
     def queue_id(self) -> str:
         """The MA queue id this bridge controls (== the bound player id)."""
         return self.provider.mass_player_id
+
+    @property
+    def session_active(self) -> bool:
+        """Whether a cast queue has been loaded (state reporting is gated on this)."""
+        return bool(self._video_ids)
+
+    def start(self) -> None:
+        """Subscribe to MA events for the bound player to mirror state to senders."""
+        self._unsubs.append(
+            self.mass.subscribe(
+                self._on_ma_event,
+                (
+                    EventType.PLAYER_UPDATED,
+                    EventType.QUEUE_UPDATED,
+                    EventType.QUEUE_TIME_UPDATED,
+                    EventType.QUEUE_ITEMS_UPDATED,
+                ),
+                id_filter=self.queue_id,
+            )
+        )
+
+    def stop(self) -> None:
+        """Unsubscribe from MA events."""
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
 
     async def handle_message(self, message: LoungeMessage) -> bool:
         """
@@ -74,7 +127,12 @@ class CastQueueBridge:
                 await self.mass.player_queues.seek(self.queue_id, position)
             case "setVolume":
                 volume = int(float(payload.get("volume") or 0))
+                self._phone_volume = (volume, time.monotonic())
                 await self.mass.players.cmd_volume_set(self.queue_id, volume)
+            case "getNowPlaying":
+                await self._send_now_playing(message.aid)
+            case "getVolume":
+                await self._send_volume(message.aid)
             case _:
                 return False
         return True
@@ -109,6 +167,7 @@ class CastQueueBridge:
             self._video_ids = video_ids
             self._index_map = index_map
             self._list_id = list_id
+            self._ctt = payload.get("ctt")
 
             await self.mass.player_queues.play_media(
                 self.queue_id,
@@ -190,3 +249,134 @@ class CastQueueBridge:
             if ma_index == queue.current_index:
                 return lounge_index
         return None
+
+    async def _on_ma_event(self, event: MassEvent) -> None:
+        """Mirror MA player/queue state changes back to connected senders."""
+        session = self.provider.lounge_session
+        if not session or not session.running or not self.session_active:
+            return
+        if event.event == EventType.PLAYER_UPDATED:
+            await self._maybe_send_volume()
+        await self._push_state()
+
+    async def _push_state(self) -> None:
+        """Send state (and track change) updates, debounced."""
+        session = self.provider.lounge_session
+        assert session is not None
+        status, position, duration, lounge_index = self._snapshot()
+        video_id = (
+            self._video_ids[lounge_index]
+            if lounge_index is not None and lounge_index < len(self._video_ids)
+            else None
+        )
+        track_changed = video_id != self._last_video_id
+        state_changed = status != self._last_status
+        seeked = abs(position - self._last_position) > 3
+        self._last_position = position
+        if not (track_changed or state_changed or seeked):
+            return
+        self._last_video_id = video_id
+        self._last_status = status
+        if track_changed:
+            self._cpn = _new_cpn()
+        messages: list[LoungeMessage] = []
+        if track_changed and video_id:
+            messages.append(self._build_now_playing(None, video_id, status, position, duration))
+        messages.append(
+            on_state_change(
+                None, status=status, position=position, duration=duration, cpn=self._cpn
+            )
+        )
+        if track_changed and lounge_index is not None:
+            messages.append(
+                on_has_previous_next_changed(
+                    None,
+                    has_previous=lounge_index > 0,
+                    has_next=lounge_index < len(self._video_ids) - 1,
+                )
+            )
+        await session.send(messages, defer=("state", STATE_PUSH_DEBOUNCE))
+
+    async def _maybe_send_volume(self) -> None:
+        """Report player volume changes, suppressing echoes of phone-set values."""
+        session = self.provider.lounge_session
+        assert session is not None
+        player = self.mass.players.get_player(self.queue_id)
+        if not player or player.volume_level is None:
+            return
+        level = int(player.volume_level)
+        if level == self._last_volume_sent:
+            return
+        if self._phone_volume:
+            phone_level, when = self._phone_volume
+            if level == phone_level and time.monotonic() - when < VOLUME_ECHO_WINDOW:
+                self._last_volume_sent = level
+                return
+        self._last_volume_sent = level
+        await session.send(
+            on_volume_changed(None, level=level, muted=level == 0),
+            defer=("volume", STATE_PUSH_DEBOUNCE),
+        )
+
+    async def _send_now_playing(self, aid: int | None) -> None:
+        """Answer a getNowPlaying probe with the real current state."""
+        session = self.provider.lounge_session
+        assert session is not None
+        status, position, duration, lounge_index = self._snapshot()
+        video_id = (
+            self._video_ids[lounge_index]
+            if lounge_index is not None and lounge_index < len(self._video_ids)
+            else None
+        )
+        if video_id:
+            await session.send(self._build_now_playing(aid, video_id, status, position, duration))
+        else:
+            await session.send(now_playing(aid))
+
+    async def _send_volume(self, aid: int | None) -> None:
+        """Answer a getVolume probe with the real player volume."""
+        session = self.provider.lounge_session
+        assert session is not None
+        player = self.mass.players.get_player(self.queue_id)
+        level = int(player.volume_level or 0) if player else 0
+        self._last_volume_sent = level
+        await session.send(on_volume_changed(aid, level=level, muted=level == 0))
+
+    def _build_now_playing(
+        self, aid: int | None, video_id: str, status: int, position: float, duration: float
+    ) -> LoungeMessage:
+        lounge_index = self._video_ids.index(video_id) if video_id in self._video_ids else None
+        return now_playing(
+            aid,
+            video_id=video_id,
+            status=status,
+            position=position,
+            duration=duration,
+            cpn=self._cpn,
+            list_id=self._list_id,
+            current_index=lounge_index,
+            ctt=self._ctt,
+        )
+
+    def _snapshot(self) -> tuple[int, float, float, int | None]:
+        """Return (lounge status code, position, duration, lounge index) for the queue."""
+        queue = self.mass.player_queues.get(self.queue_id)
+        if not queue:
+            return PLAYER_STATUS_IDLE, 0, 0, None
+        match queue.state:
+            case PlaybackState.PLAYING:
+                status = PLAYER_STATUS_PLAYING
+            case PlaybackState.PAUSED:
+                status = PLAYER_STATUS_PAUSED
+            case _:
+                status = PLAYER_STATUS_IDLE
+        position = float(queue.corrected_elapsed_time or 0)
+        duration = 0.0
+        if queue.current_item and queue.current_item.duration:
+            duration = float(queue.current_item.duration)
+        return status, position, duration, self._current_lounge_index()
+
+
+def _new_cpn() -> str:
+    """Generate a 16-char client playback nonce."""
+    return secrets.token_urlsafe(12)

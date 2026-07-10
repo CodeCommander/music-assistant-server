@@ -28,11 +28,7 @@ from music_assistant.helpers.util import select_free_port
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.ytmusic_cast.bridge import CastQueueBridge
 from music_assistant.providers.ytmusic_cast.dial import DialServer
-from music_assistant.providers.ytmusic_cast.lounge.messages import (
-    LoungeMessage,
-    now_playing,
-    on_volume_changed,
-)
+from music_assistant.providers.ytmusic_cast.lounge.messages import LoungeMessage
 from music_assistant.providers.ytmusic_cast.lounge.session import LoungeSession, ScreenInfo
 from music_assistant.providers.ytmusic_cast.ssdp import DialAdvertisement, SharedSsdpResponder
 
@@ -171,6 +167,7 @@ class YTMusicCastProvider(PluginProvider):
             logger=self.logger,
         )
         self._bridge = CastQueueBridge(self)
+        self._bridge.start()
         self.mass.create_task(self._start_lounge_session())
         self.logger.info(
             "Cast target '%s' advertising for player %s (DIAL port %s)",
@@ -179,8 +176,16 @@ class YTMusicCastProvider(PluginProvider):
             port,
         )
 
+    @property
+    def lounge_session(self) -> LoungeSession | None:
+        """The lounge session for this cast target (None before init completes)."""
+        return self._lounge_session
+
     async def unload(self, is_removed: bool = False) -> None:
         """Tear down lounge session, SSDP advertisement and DIAL endpoint."""
+        if self._bridge:
+            self._bridge.stop()
+            self._bridge = None
         if self._lounge_session:
             await self._lounge_session.end()
             self._lounge_session = None
@@ -243,17 +248,9 @@ class YTMusicCastProvider(PluginProvider):
                 "LOUNGE message '%s' (AID=%s): %s", message.name, message.aid, message.payload
             )
             try:
-                if await self._bridge.handle_message(message):
-                    continue
+                await self._bridge.handle_message(message)
             except Exception as err:
                 self.logger.exception("Error handling '%s' message: %s", message.name, err)
-                continue
-            if message.name == "getNowPlaying":
-                await self._lounge_session.send(now_playing(message.aid))
-            elif message.name == "getVolume":
-                await self._lounge_session.send(
-                    on_volume_changed(message.aid, level=50, muted=False)
-                )
 
     def _handle_lounge_terminate(self, error: Exception) -> None:
         """Log irrecoverable lounge session death (a cast will restart it via retry)."""
