@@ -151,6 +151,10 @@ class LoungeSession:
         is_refreshing = self._status == "refreshing"
         if not is_refreshing:
             self._status = "starting"
+        # the worker must be running BEFORE _establish: the init bind can carry
+        # sender probes (e.g. getNowPlaying) whose replies await the send queue
+        if self._send_worker_task is None or self._send_worker_task.done():
+            self._send_worker_task = asyncio.create_task(self._send_worker())
         try:
             await self._establish()
         except Exception as err:
@@ -161,8 +165,6 @@ class LoungeSession:
             raise LoungeSessionError(f"Failed to establish lounge session: {err}") from err
         if not is_refreshing:
             self._status = "running"
-        if self._send_worker_task is None or self._send_worker_task.done():
-            self._send_worker_task = asyncio.create_task(self._send_worker())
         self.logger.debug("Lounge session established (screen_id=%s)", self._screen_id)
 
     async def end(self, error: Exception | None = None) -> None:

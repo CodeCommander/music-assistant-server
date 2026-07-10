@@ -209,9 +209,18 @@ class YTMusicCastProvider(PluginProvider):
         connection completes through YouTube's cloud.
         """
         pairing_code = params.get("pairingCode", "")
-        if not self._lounge_session or not self._lounge_session.running:
-            self.logger.warning("Cast launch received but lounge session is not running")
+        if not self._lounge_session:
+            self.logger.warning("Cast launch received but lounge session does not exist")
             return
+        if not self._lounge_session.running:
+            # session may have died (or never come up): a cast is the perfect
+            # moment to try bringing it back
+            self.logger.info("Lounge session not running; starting it for this cast")
+            try:
+                await self._lounge_session.begin()
+            except Exception as err:
+                self.logger.error("Cannot handle cast: lounge session failed to start: %s", err)
+                return
         try:
             await self._lounge_session.register_pairing_code(pairing_code)
         except Exception as err:
